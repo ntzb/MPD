@@ -71,13 +71,6 @@ android {
                 abiFilters += listOf("armeabi-v7a")
             }
         }
-        create("armeabi-v7a") {
-            ndk {
-                // ABI to include in package (32-bit ARM, e.g. Galaxy S5)
-                //noinspection ChromeOsAbiSupport
-                abiFilters += listOf("armeabi-v7a")
-            }
-        }
         create("arm64-v8a") {
             ndk {
                 // ABI to include in package

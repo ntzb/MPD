@@ -94,6 +94,20 @@ jobs:
             --buildtype=debugoptimized -Db_ndebug=true \
             -Dwrap_mode=forcefallback
 
+      # Reuse one stable debug key across all builds so APKs upgrade in place
+      # (no uninstall, which would wipe mpd.conf/state under Android/data).
+      - name: Restore stable debug keystore
+        env:
+          DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$DEBUG_KEYSTORE_B64" ]; then
+            mkdir -p "$HOME/.android"
+            echo "$DEBUG_KEYSTORE_B64" | base64 -d > "$HOME/.android/debug.keystore"
+            echo "Restored stable debug keystore."
+          else
+            echo "::warning::DEBUG_KEYSTORE_B64 secret not set — using an ephemeral debug key; this build will NOT upgrade over previous installs."
+          fi
+
       - name: Assemble debug APK (${{ matrix.abi }})
         run: |
           cd ./android
