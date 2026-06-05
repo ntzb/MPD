@@ -1,0 +1,142 @@
+name: Build MPD Android APK
+
+# Runs weekly and only builds when the upstream MPD source actually changed.
+# Also runnable on demand (with an optional force-build).
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build even if upstream has no new commits"
+        type: boolean
+        default: true
+  schedule:
+    - cron: "0 6 * * 1"   # every Monday 06:00 UTC
+
+permissions:
+  contents: write   # create/update the Release and push the upstream merge
+
+env:
+  UPSTREAM_REPO: https://github.com/MusicPlayerDaemon/MPD.git
+  UPSTREAM_BRANCH: master   # change to v0.24.x to track the stable series
+  RELEASE_TAG: mpd-android-latest
+
+jobs:
+  # 1) Sync upstream and decide whether a build is needed.
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      build: ${{ steps.detect.outputs.build }}
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Sync upstream and detect changes
+        id: detect
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_REPO" 2>/dev/null || git remote set-url upstream "$UPSTREAM_REPO"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+
+          FORCE="${{ (github.event_name == 'workflow_dispatch' && inputs.force) && 'true' || 'false' }}"
+          if [ "$FORCE" != "true" ] && git merge-base --is-ancestor "upstream/$UPSTREAM_BRANCH" HEAD; then
+            echo "No new upstream commits since last build — skipping."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Merging upstream/$UPSTREAM_BRANCH ..."
+          # Plain merge: if upstream ever rewrites our patched files it conflicts
+          # and fails loudly (email) instead of silently dropping the v7a flavor.
+          git merge --no-edit "upstream/$UPSTREAM_BRANCH"
+          git push origin HEAD
+          echo "build=true" >> "$GITHUB_OUTPUT"
+
+  # 2) Build each ABI on its own runner, in parallel.
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: armeabi-v7a
+            task: assembleArmeabi-v7aDebug
+          - abi: arm64-v8a
+            task: assembleArm64-v8aDebug
+    steps:
+      - name: Checkout fork (synced tip)
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref_name }}   # the branch tip the check job just pushed
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends meson ccache quilt
+
+      - name: Restore ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: android-mpd-${{ matrix.abi }}
+
+      - name: Build native libs (${{ matrix.abi }})
+        run: |
+          mkdir -p output/${{ matrix.abi }}
+          cd ./output/${{ matrix.abi }}
+          ../../android/build.py \
+            "$ANDROID_SDK_ROOT" "$ANDROID_NDK_LATEST_HOME" \
+            ${{ matrix.abi }} \
+            --buildtype=debugoptimized -Db_ndebug=true \
+            -Dwrap_mode=forcefallback
+
+      - name: Assemble debug APK (${{ matrix.abi }})
+        run: |
+          cd ./android
+          export JAVA_HOME="$JAVA_HOME_17_X64"
+          ./gradlew ${{ matrix.task }}
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mpd-apk-${{ matrix.abi }}
+          path: android/app/build/outputs/apk/${{ matrix.abi }}/debug/*.apk
+          if-no-files-found: error
+
+  # 3) Collect both APKs and publish/update the release.
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download built APKs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: mpd-apk-*
+          path: apks
+          merge-multiple: true
+
+      - name: Publish/update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mapfile -t APKS < <(find apks -name '*-debug.apk' | sort)
+          if [ "${#APKS[@]}" -lt 2 ]; then
+            echo "ERROR: expected 2 APKs (v7a + arm64), found ${#APKS[@]}:" >&2
+            printf '%s\n' "${APKS[@]}" >&2
+            exit 1
+          fi
+          echo "APKs to publish:"
+          printf '  %s\n' "${APKS[@]}"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${APKS[@]}" --clobber
+          else
+            gh release create "$RELEASE_TAG" "${APKS[@]}" \
+              --target "${{ github.ref_name }}" \
+              --title "MPD Android (latest CI build)" \
+              --notes "Automated build. APKs: armeabi-v7a (32-bit, e.g. Galaxy S5) and arm64-v8a (64-bit)."
+          fi

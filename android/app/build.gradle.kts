@@ -64,6 +64,13 @@ android {
                 }
             }
         }
+        create("armeabi-v7a") {
+            ndk {
+                // ABI to include in package (32-bit ARM, e.g. Galaxy S5)
+                //noinspection ChromeOsAbiSupport
+                abiFilters += listOf("armeabi-v7a")
+            }
+        }
         create("arm64-v8a") {
             ndk {
                 // ABI to include in package
@@ -80,7 +87,7 @@ android {
         create("universal") {
             ndk {
                 // ABI to include in package
-                abiFilters += listOf("arm64-v8a", "x86_64")
+                abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86_64")
             }
         }
     }
