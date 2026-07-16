@@ -49,9 +49,27 @@ jobs:
           fi
 
           echo "Merging upstream/$UPSTREAM_BRANCH ..."
+          BEFORE="$(git rev-parse HEAD)"
           # Plain merge: if upstream ever rewrites our patched files it conflicts
           # and fails loudly (email) instead of silently dropping the v7a flavor.
           git merge --no-edit "upstream/$UPSTREAM_BRANCH"
+
+          # The built-in GITHUB_TOKEN is forbidden from pushing ANY commit that
+          # changes files under .github/workflows/ (it can't hold the `workflow`
+          # scope). Upstream's own CI (build.yml, build_android.yml, ...) changes
+          # frequently, which is what makes `git push` fail with "refusing to
+          # allow a GitHub App to ... without workflows permission".
+          # This fork doesn't use those upstream workflows (only build-apk.yml),
+          # so pin the whole workflows dir back to our pre-merge version and fold
+          # it into the merge commit itself — the single commit we push then has
+          # ZERO changes under .github/workflows/, so the token is allowed to
+          # push it. Upstream source changes still merge normally, and the merge
+          # commit keeps upstream as a parent so the is-ancestor check above still
+          # correctly skips builds when there are no new upstream commits.
+          git rm -r --ignore-unmatch --quiet .github/workflows >/dev/null
+          git checkout "$BEFORE" -- .github/workflows
+          git commit --amend --no-edit
+
           git push origin HEAD
           echo "build=true" >> "$GITHUB_OUTPUT"
 
