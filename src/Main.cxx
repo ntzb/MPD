@@ -395,11 +395,14 @@ MainConfigured(const CommandLineOptions &options,
 
 	command_init();
 
+	instance.outputs.Configure(instance.io_thread.GetEventLoop(),
+				   instance.rtio_thread.GetEventLoop(),
+				   raw_config,
+				   partition_config.player.replay_gain);
+
+	instance.partitions.front().outputs.AcquireAll(instance.partitions.front().replay_gain_mode);
+
 	for (auto &partition : instance.partitions) {
-		partition.outputs.Configure(instance.io_thread.GetEventLoop(),
-					    instance.rtio_thread.GetEventLoop(),
-					    raw_config,
-					    partition_config.player.replay_gain);
 		partition.UpdateEffectiveReplayGainMode();
 	}
 
@@ -408,8 +411,7 @@ MainConfigured(const CommandLineOptions &options,
 		if (name == nullptr)
 			throw std::runtime_error("Missing 'name'");
 
-		instance.partitions.emplace_back(instance, name,
-						 partition_config);
+		instance.partitions.emplace_back(name, instance.partitions.front());
 	});
 
 	client_manager_init(raw_config);
@@ -420,6 +422,10 @@ MainConfigured(const CommandLineOptions &options,
 
 #ifdef ENABLE_DAEMON
 	daemonize_commit();
+#endif
+
+#ifdef ENABLE_DBUS
+	instance.inhibit_idle = raw_config.GetBool(ConfigOption::INHIBIT_IDLE, false);
 #endif
 
 #ifndef ANDROID
