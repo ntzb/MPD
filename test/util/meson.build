@@ -4,6 +4,7 @@ test(
     'TestUtil',
     'TestCircularBuffer.cxx',
     'TestException.cxx',
+    'TestIntOverflow.cxx',
     'TestIntrusiveForwardList.cxx',
     'TestIntrusiveHashSet.cxx',
     'TestIntrusiveList.cxx',
@@ -14,10 +15,6 @@ test(
     'TestStringStrip.cxx',
     'TestTemplateString.cxx',
     'TestTerminatedArray.cxx',
-    'TestUriExtract.cxx',
-    'TestUriQueryParser.cxx',
-    'TestUriRelative.cxx',
-    'TestUriUtil.cxx',
     'test_byte_reverse.cxx',
     include_directories: inc,
     dependencies: [
