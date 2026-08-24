@@ -1,0 +1,189 @@
+name: Release MPD Android APK (per upstream version)
+
+# Mirrors upstream MPD *version releases* as releases on this fork: when
+# MusicPlayerDaemon/MPD publishes a new stable version tag (vN.N[.N]), this
+# builds that exact tag — with our armeabi-v7a patch applied — and publishes a
+# matching versioned GitHub Release here (armeabi-v7a + arm64-v8a APKs).
+#
+# This is separate from build-apk.yml, which tracks the bleeding-edge master
+# branch into a single rolling `mpd-android-latest` release. Both can coexist.
+#
+# Upstream does NOT use GitHub Releases, only tags, so we detect the newest
+# stable tag via the tags API and skip if we already published it.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to build (blank = newest stable). e.g. v0.24.13"
+        type: string
+        default: ""
+  schedule:
+    - cron: "0 7 * * *"   # daily 07:00 UTC — upstream releases are infrequent
+
+permissions:
+  contents: write   # create the versioned Release (and its tag) on this repo
+
+env:
+  UPSTREAM_REPO: https://github.com/MusicPlayerDaemon/MPD.git
+  UPSTREAM_API: MusicPlayerDaemon/MPD
+  PATCH: .github/patches/android-armeabi-v7a.patch
+
+jobs:
+  # 1) Find the newest upstream stable tag; skip if we already released it.
+  detect:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      build: ${{ steps.pick.outputs.build }}
+    steps:
+      - name: Pick target tag
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          REQ="${{ inputs.tag }}"
+          if [ -n "$REQ" ]; then
+            tag="$REQ"
+            echo "Manual request: $tag"
+          else
+            # Newest stable version tag (vN.N or vN.N.N) — excludes _alpha/_beta.
+            tag="$(gh api "repos/${UPSTREAM_API}/tags" --paginate --jq '.[].name' \
+              | grep -E '^v[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+              | sort -V | tail -1)"
+            echo "Newest upstream stable tag: $tag"
+          fi
+          if [ -z "$tag" ]; then
+            echo "Could not determine an upstream tag." >&2
+            exit 1
+          fi
+
+          # Already published here? (a release with this tag exists)
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag already exists on this repo — nothing to do."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  # 2) Build each ABI from the upstream tag + our v7a patch, in parallel.
+  build:
+    needs: detect
+    if: needs.detect.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: armeabi-v7a
+            task: assembleArmeabi-v7aDebug
+          - abi: arm64-v8a
+            task: assembleArm64-v8aDebug
+    steps:
+      - name: Checkout fork (for the patch)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+
+      - name: Check out upstream tag + apply v7a patch
+        env:
+          TAG: ${{ needs.detect.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Keep the patch where a tag checkout can't delete it.
+          cp "$PATCH" "$RUNNER_TEMP/v7a.patch"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch --no-tags upstream "refs/tags/${TAG}:refs/tags/${TAG}"
+          git checkout --force "refs/tags/${TAG}"
+          # Loud failure if upstream moved the gradle flavor block (needs a patch refresh).
+          git apply -p1 "$RUNNER_TEMP/v7a.patch"
+          echo "Built from upstream ${TAG} with armeabi-v7a patch applied."
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends meson ccache quilt
+
+      - name: Restore ccache
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03 # v1.2.23
+        with:
+          key: android-mpd-release-${{ matrix.abi }}
+
+      - name: Build native libs (${{ matrix.abi }})
+        run: |
+          mkdir -p output/${{ matrix.abi }}
+          cd ./output/${{ matrix.abi }}
+          ../../android/build.py \
+            "$ANDROID_SDK_ROOT" "$ANDROID_NDK_LATEST_HOME" \
+            ${{ matrix.abi }} \
+            --buildtype=debugoptimized -Db_ndebug=true \
+            -Dwrap_mode=forcefallback
+
+      # Same stable debug key as the rolling build so versioned APKs also
+      # upgrade in place (no uninstall, which would wipe mpd.conf/state).
+      - name: Restore stable debug keystore
+        env:
+          DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$DEBUG_KEYSTORE_B64" ]; then
+            mkdir -p "$HOME/.android"
+            echo "$DEBUG_KEYSTORE_B64" | base64 -d > "$HOME/.android/debug.keystore"
+            echo "Restored stable debug keystore."
+          else
+            echo "::warning::DEBUG_KEYSTORE_B64 secret not set — using an ephemeral debug key; this build will NOT upgrade over previous installs."
+          fi
+
+      - name: Assemble debug APK (${{ matrix.abi }})
+        run: |
+          cd ./android
+          export JAVA_HOME="$JAVA_HOME_17_X64"
+          ./gradlew ${{ matrix.task }}
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mpd-apk-${{ matrix.abi }}
+          path: android/app/build/outputs/apk/${{ matrix.abi }}/debug/*.apk
+          if-no-files-found: error
+
+  # 3) Publish a versioned release named after the upstream tag.
+  release:
+    needs: [detect, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout (needed for gh release --target)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Download built APKs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: mpd-apk-*
+          path: apks
+          merge-multiple: true
+
+      - name: Publish versioned GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.detect.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mapfile -t APKS < <(find apks -name '*-debug.apk' | sort)
+          if [ "${#APKS[@]}" -lt 2 ]; then
+            echo "ERROR: expected 2 APKs (v7a + arm64), found ${#APKS[@]}:" >&2
+            printf '%s\n' "${APKS[@]}" >&2
+            exit 1
+          fi
+          echo "APKs to publish for ${TAG}:"; printf '  %s\n' "${APKS[@]}"
+          # Idempotent: if a partial release exists, replace its assets; else create.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${APKS[@]}" --clobber
+          else
+            gh release create "$TAG" "${APKS[@]}" \
+              --target "${{ github.ref_name }}" \
+              --title "MPD ${TAG} (Android)" \
+              --notes "Android build of upstream MPD ${TAG} (https://github.com/${UPSTREAM_API}/releases/tag/${TAG}) with the armeabi-v7a patch. APKs: armeabi-v7a (32-bit, e.g. Galaxy S5) and arm64-v8a (64-bit)."
+          fi

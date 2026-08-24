@@ -1,0 +1,16 @@
+# Patch files must stay LF-only so `git apply` works on the Linux CI runner
+# even when committed from Windows.
+*.patch text eol=lf
+
+# Our workflow YAML embeds bash (`run: |`). Keep it LF so no CR sneaks into the
+# scripts and breaks `bash -e` on the Linux runner, regardless of git autocrlf.
+.github/workflows/*.yml text eol=lf
+
+# We deliberately keep only our own CI workflow (build-apk.yml / release-apk.yml)
+# and never carry upstream MPD's workflow files forward — the built-in
+# GITHUB_TOKEN can't push changes under .github/workflows/. Freezing them makes
+# our branch diverge from upstream on those files, so every later sync would hit
+# a 3-way merge CONFLICT. The `ours` merge driver auto-resolves that in our
+# favor (keeps our version, no conflict). Requires `git config merge.ours.driver
+# true` at merge time (set in build-apk.yml).
+.github/workflows/** merge=ours

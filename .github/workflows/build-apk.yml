@@ -38,6 +38,10 @@ jobs:
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Enables the `merge=ours` driver declared in .gitattributes for
+          # .github/workflows/** — auto-resolves the perpetual conflict caused by
+          # our branch freezing (and thus diverging from) upstream's workflow files.
+          git config merge.ours.driver true
           git remote add upstream "$UPSTREAM_REPO" 2>/dev/null || git remote set-url upstream "$UPSTREAM_REPO"
           git fetch --no-tags upstream "$UPSTREAM_BRANCH"
 
