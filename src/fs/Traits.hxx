@@ -133,7 +133,7 @@ struct PathTraitsFS {
 	[[gnu::pure]]
 	static bool IsAbsolute(string_view p) noexcept {
 #ifdef _WIN32
-		if (IsDrive(p) && IsSeparator(p[2]))
+		if (p.size() >= 3 && IsDrive(p) && IsSeparator(p[2]))
 			return true;
 #endif
 		return !p.empty() && IsSeparator(p.front());
@@ -289,7 +289,7 @@ struct PathTraitsUTF8 {
 	[[gnu::pure]]
 	static bool IsAbsolute(string_view p) noexcept {
 #ifdef _WIN32
-		if (IsDrive(p) && IsSeparator(p[2]))
+		if (p.size() >= 3 && IsDrive(p) && IsSeparator(p[2]))
 			return true;
 #endif
 		return !p.empty() && IsSeparator(p.front());
@@ -299,8 +299,8 @@ struct PathTraitsUTF8 {
 	 * Is this any kind of absolute URI? (Unlike IsAbsolute(),
 	 * this includes URIs/URLs with a scheme)
 	 */
-	[[gnu::pure]] [[gnu::nonnull]]
-	static bool IsAbsoluteOrHasScheme(const_pointer p) noexcept;
+	[[gnu::pure]]
+	static bool IsAbsoluteOrHasScheme(string_view p) noexcept;
 
 	[[gnu::pure]] [[gnu::nonnull]]
 	static bool IsSpecialFilename(const_pointer name) noexcept {

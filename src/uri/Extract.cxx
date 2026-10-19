@@ -8,6 +8,8 @@
 
 #include <cstring>
 
+using std::string_view_literals::operator""sv;
+
 static constexpr bool
 IsValidSchemeStart(char ch) noexcept
 {
@@ -40,7 +42,7 @@ UriHasScheme(std::string_view uri) noexcept
 std::string_view
 UriGetScheme(std::string_view uri) noexcept
 {
-	auto end = uri.find("://");
+	auto end = uri.find("://"sv);
 	if (end == std::string_view::npos)
 		return {};
 
@@ -62,10 +64,23 @@ UriAfterScheme(std::string_view uri) noexcept
 	return {};
 }
 
-bool
-UriIsRelativePath(const char *uri) noexcept
+std::string_view
+UriGetOrigin(std::string_view uri) noexcept
 {
-	return !UriHasScheme(uri) && *uri != '/';
+	const auto after_scheme = UriAfterScheme(uri);
+	if (after_scheme.data() == nullptr)
+		return {};
+
+	/* the authority ends at the first slash, question mark or
+	   hash (RFC 3986 3.2) */
+	const auto authority = after_scheme.substr(0, after_scheme.find_first_of("/?#"sv));
+	return {uri.begin(), authority.end()};
+}
+
+bool
+UriIsRelativePath(std::string_view uri) noexcept
+{
+	return !UriHasScheme(uri) && !uri.starts_with('/');
 }
 
 std::string_view

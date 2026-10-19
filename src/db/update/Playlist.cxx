@@ -18,9 +18,30 @@
 #include "storage/FileInfo.hxx"
 #include "storage/StorageInterface.hxx"
 #include "fs/Traits.hxx"
+#include "uri/Util.hxx"
+#include "util/StringCompare.hxx"
 #include "Log.hxx"
 
-#include <fmt/core.h>
+#include <fmt/format.h>
+
+using std::string_view_literals::operator""sv;
+
+using std::string_view_literals::operator""sv;
+
+/**
+ * Is this relative playlist entry safe, i.e. does it contain no "."
+ * or ".." segments except for a leading run?  Only leading ".."
+ * segments are resolved within the database
+ * (Directory::LookupTargetSong(), uri_apply_relative()); others would
+ * be passed to the filesystem, escaping the music directory.
+ */
+[[gnu::pure]]
+static bool
+IsSafeRelativeEntry(std::string_view uri) noexcept
+{
+	while (SkipPrefix(uri, "../"sv) || SkipPrefix(uri, "./"sv)) {}
+	return uri_safe_local(uri);
+}
 
 inline void
 UpdateWalk::UpdatePlaylistFile(Directory &directory,
@@ -36,13 +57,27 @@ UpdateWalk::UpdatePlaylistFile(Directory &directory,
 		auto db_song = std::make_unique<Song>(std::move(*song),
 						      directory);
 		const bool is_absolute =
-			PathTraitsUTF8::IsAbsoluteOrHasScheme(db_song->filename.c_str());
+			PathTraitsUTF8::IsAbsoluteOrHasScheme(db_song->filename);
+		if (!is_absolute && !IsSafeRelativeEntry(db_song->filename))
+			continue;
+
+		if (PathTraitsUTF8::IsAbsolute(db_song->filename)) {
+			/* absolute local paths are allowed only if
+			   they are inside the storage, or else the
+			   playlist would make MPD open arbitrary
+			   files */
+			const auto relative = storage.MapToRelativeUTF8(db_song->filename);
+			if (relative.data() == nullptr ||
+			    !uri_safe_local(relative))
+				continue;
+		}
+
 		db_song->target = is_absolute
-			? db_song->filename
+			? std::move(db_song->filename)
 			/* prepend "../" to relative paths to go from
 			   the virtual directory (DEVICE_PLAYLIST) to
 			   the containing directory */
-			: "../" + db_song->filename;
+			: fmt::format("../{}"sv, db_song->filename);
 		db_song->filename = fmt::format("track{:04}", ++track);
 
 		{
@@ -129,8 +164,8 @@ UpdateWalk::PurgeDanglingFromPlaylists(Directory &directory) noexcept
 
 	directory.ForEachSongSafe([&](Song &song){
 		if (!song.target.empty() &&
-		    !PathTraitsUTF8::IsAbsoluteOrHasScheme(song.target.c_str())) {
-			Song *target = directory.LookupTargetSong(song.target.c_str());
+		    !PathTraitsUTF8::IsAbsoluteOrHasScheme(song.target)) {
+			Song *target = directory.LookupTargetSong(song.target);
 			if (target == nullptr) {
 				/* the target does not exist: remove
 				   the virtual song */
