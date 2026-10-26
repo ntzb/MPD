@@ -406,7 +406,7 @@ CreateUdisksStorageURI(EventLoop &event_loop, std::string_view base_uri)
 	while (relative_path.starts_with('/'))
 		relative_path = relative_path.substr(1);
 
-	if (!relative_path.empty() && !uri_safe_local(relative_path))
+	if (!relative_path.empty() && !UriIsCanonicalRelativePath(relative_path))
 		/* don't allow escaping the mount point with ".." */
 		throw std::invalid_argument{"Malformed udisks:// URI"};
 
@@ -425,4 +425,6 @@ const StoragePlugin udisks_storage_plugin = {
 	"udisks",
 	udisks_prefixes,
 	CreateUdisksStorageURI,
+	/* opening it mounts a filesystem */
+	true,
 };

@@ -5,6 +5,7 @@
 #include "VolumeMapping.hxx"
 #include "lib/alsa/NonBlock.hxx"
 #include "lib/alsa/Error.hxx"
+#include "lib/alsa/PcmCard.hxx"
 #include "lib/fmt/RuntimeError.hxx"
 #include "lib/fmt/ToBuffer.hxx"
 #include "mixer/Mixer.hxx"
@@ -13,12 +14,18 @@
 #include "event/MultiSocketMonitor.hxx"
 #include "event/InjectEvent.hxx"
 #include "event/Call.hxx"
+#include "thread/Mutex.hxx"
 #include "util/ASCII.hxx"
 #include "util/Domain.hxx"
 #include "Log.hxx"
 
 #include <alsa/asoundlib.h>
 #include <cmath>
+
+#include <fmt/format.h>
+
+#include <iterator> // for std::back_inserter()
+#include <string>
 
 #define VOLUME_MIXER_ALSA_DEFAULT		"default"
 #define VOLUME_MIXER_ALSA_CONTROL_DEFAULT	"PCM"
@@ -27,15 +34,22 @@ static constexpr unsigned VOLUME_MIXER_ALSA_INDEX_DEFAULT = 0;
 class AlsaMixerMonitor final : MultiSocketMonitor {
 	InjectEvent defer_invalidate_sockets;
 
+	/**
+	 * Protects the #snd_mixer_t (see AlsaMixer::handle_mutex).
+	 */
+	Mutex &mutex;
+
 	snd_mixer_t *mixer;
 
 	Alsa::NonBlockMixer non_block;
 
 public:
-	AlsaMixerMonitor(EventLoop &_loop, snd_mixer_t *_mixer) noexcept
+	AlsaMixerMonitor(EventLoop &_loop, Mutex &_mutex,
+			 snd_mixer_t *_mixer) noexcept
 		:MultiSocketMonitor(_loop),
 		 defer_invalidate_sockets(_loop,
 					  BIND_THIS_METHOD(InvalidateSockets)),
+		 mutex(_mutex),
 		 mixer(_mixer) {
 		defer_invalidate_sockets.Schedule();
 	}
@@ -58,9 +72,35 @@ private:
 class AlsaMixer final : public Mixer {
 	EventLoop &event_loop;
 
-	const char *device;
+	/**
+	 * The "mixer_device" setting (nullptr if not configured).
+	 */
+	const char *mixer_device;
+
+	/**
+	 * The "device" setting of the ALSA output (nullptr if not
+	 * configured).  Its sound card is used if "mixer_device" is
+	 * not configured.
+	 */
+	const char *pcm_device;
+
+	/**
+	 * The mixer device which is actually used; determined by
+	 * Open().
+	 */
+	std::string device;
+
 	const char *control;
 	unsigned int index;
+
+	/**
+	 * Protects #handle, #elem, #desired_volume and
+	 * #resulting_volume while #monitor exists, because libasound
+	 * is not thread-safe, and #monitor uses the #snd_mixer_t in
+	 * the #EventLoop thread while SetVolume() and GetVolume() are
+	 * called from other threads.
+	 */
+	Mutex handle_mutex;
 
 	snd_mixer_t *handle;
 	snd_mixer_elem_t *elem;
@@ -96,6 +136,7 @@ public:
 	AlsaMixer &operator=(const AlsaMixer &) = delete;
 
 	void Configure(const ConfigBlock &block);
+	std::string DetermineDevice() const;
 	void Setup();
 
 	/* virtual methods from class Mixer */
@@ -103,6 +144,7 @@ public:
 	void Close() noexcept override;
 	int GetVolume() override;
 	void SetVolume(unsigned volume) override;
+	unsigned ScaleVolume(unsigned volume, float scale) noexcept override;
 
 private:
 	[[gnu::const]]
@@ -121,6 +163,10 @@ private:
 		return NormalizedToPercent(GetNormalizedVolume());
 	}
 
+	/**
+	 * Called by snd_mixer_handle_events() while #handle_mutex is
+	 * locked.
+	 */
 	static int ElemCallback(snd_mixer_elem_t *elem,
 				unsigned mask) noexcept;
 
@@ -136,6 +182,7 @@ AlsaMixerMonitor::PrepareSockets() noexcept
 		return Event::Duration(-1);
 	}
 
+	const std::scoped_lock lock{mutex};
 	return non_block.PrepareSockets(*this, mixer);
 }
 
@@ -143,6 +190,8 @@ void
 AlsaMixerMonitor::DispatchSockets() noexcept
 {
 	assert(mixer != nullptr);
+
+	const std::scoped_lock lock{mutex};
 
 	non_block.DispatchSockets(*this, mixer);
 
@@ -200,8 +249,8 @@ AlsaMixer::ElemCallback(snd_mixer_elem_t *elem, unsigned mask) noexcept
 inline void
 AlsaMixer::Configure(const ConfigBlock &block)
 {
-	device = block.GetBlockValue("mixer_device",
-				     VOLUME_MIXER_ALSA_DEFAULT);
+	mixer_device = block.GetBlockValue("mixer_device");
+	pcm_device = block.GetBlockValue("device");
 	control = block.GetBlockValue("mixer_control",
 				      VOLUME_MIXER_ALSA_CONTROL_DEFAULT);
 	index = block.GetBlockValue("mixer_index",
@@ -242,12 +291,60 @@ alsa_mixer_lookup_elem(snd_mixer_t *handle,
 	return nullptr;
 }
 
+/**
+ * Build a human-readable list of all simple mixer controls (for
+ * error messages).
+ */
+static std::string
+alsa_mixer_list_controls(snd_mixer_t *handle)
+{
+	std::string result;
+
+	for (snd_mixer_elem_t *elem = snd_mixer_first_elem(handle);
+	     elem != nullptr; elem = snd_mixer_elem_next(elem)) {
+		if (snd_mixer_elem_get_type(elem) != SND_MIXER_ELEM_SIMPLE)
+			continue;
+
+		if (!result.empty())
+			result += ", ";
+
+		fmt::format_to(std::back_inserter(result), "{:?},{}",
+			       snd_mixer_selem_get_name(elem),
+			       snd_mixer_selem_get_index(elem));
+	}
+
+	if (result.empty())
+		result = "none";
+
+	return result;
+}
+
+inline std::string
+AlsaMixer::DetermineDevice() const
+{
+	if (mixer_device != nullptr)
+		return mixer_device;
+
+	if (pcm_device != nullptr) {
+		/* use the sound card of the PCM device */
+		if (auto card = Alsa::FindPcmCard(pcm_device);
+		    !card.empty()) {
+			FmtDebug(alsa_mixer_domain,
+				 "Using mixer device {:?} for PCM device {:?}",
+				 card, pcm_device);
+			return card;
+		}
+	}
+
+	return VOLUME_MIXER_ALSA_DEFAULT;
+}
+
 inline void
 AlsaMixer::Setup()
 {
 	int err;
 
-	if ((err = snd_mixer_attach(handle, device)) < 0)
+	if ((err = snd_mixer_attach(handle, device.c_str())) < 0)
 		throw Alsa::MakeError(err,
 				      FmtBuffer<256>("failed to attach to {}",
 						     device));
@@ -260,18 +357,22 @@ AlsaMixer::Setup()
 
 	elem = alsa_mixer_lookup_elem(handle, control, index);
 	if (elem == nullptr)
-		throw FmtRuntimeError("no such mixer control: {}", control);
+		throw FmtRuntimeError("no such mixer control {:?},{} on {:?} (available: {})",
+				      control, index, device,
+				      alsa_mixer_list_controls(handle));
 
 	snd_mixer_elem_set_callback_private(elem, this);
 	snd_mixer_elem_set_callback(elem, ElemCallback);
 
-	monitor = new AlsaMixerMonitor(event_loop, handle);
+	monitor = new AlsaMixerMonitor(event_loop, handle_mutex, handle);
 }
 
 void
 AlsaMixer::Open()
 {
 	desired_volume = resulting_volume = -1;
+
+	device = DetermineDevice();
 
 	int err;
 
@@ -292,6 +393,8 @@ AlsaMixer::Close() noexcept
 {
 	assert(handle != nullptr);
 
+	/* after this, the #EventLoop thread doesn't use #handle
+	   anymore, therefore we don't need to lock #handle_mutex */
 	delete monitor;
 
 	snd_mixer_elem_set_callback(elem, nullptr);
@@ -304,6 +407,8 @@ AlsaMixer::GetVolume()
 	int err;
 
 	assert(handle != nullptr);
+
+	const std::scoped_lock lock{handle_mutex};
 
 	err = snd_mixer_handle_events(handle);
 	if (err < 0)
@@ -322,12 +427,24 @@ AlsaMixer::SetVolume(unsigned volume)
 {
 	assert(handle != nullptr);
 
+	const std::scoped_lock lock{handle_mutex};
+
 	int err = set_normalized_playback_volume(elem, 0.01*volume, 1);
 	if (err < 0)
 		throw Alsa::MakeError(err, "failed to set ALSA volume");
 
 	desired_volume = volume;
 	resulting_volume = GetPercentVolume();
+}
+
+unsigned
+AlsaMixer::ScaleVolume(unsigned volume, float scale) noexcept
+{
+	assert(handle != nullptr);
+
+	return NormalizedToPercent(scale_normalized_playback_volume(elem,
+								    0.01 * volume,
+								    (double)scale));
 }
 
 const MixerPlugin alsa_mixer_plugin = {
